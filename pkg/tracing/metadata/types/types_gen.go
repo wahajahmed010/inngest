@@ -70,11 +70,19 @@ const (
 
 // From ai_summary.go
 type AISummaryMetadata struct {
-	InputTokens   int64    `json:"input_tokens"`
-	OutputTokens  int64    `json:"output_tokens"`
-	TotalTokens   int64    `json:"total_tokens"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+
+	// Absent when no call reported them; cache tokens are summed raw and never
+	// reconciled against InputTokens.
+	CacheReadTokens     *int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens *int64 `json:"cache_creation_tokens,omitempty"`
+	ReasoningTokens     *int64 `json:"reasoning_tokens,omitempty"`
+
 	EstimatedCost *float64 `json:"estimated_cost,omitempty"`
 	Models        []string `json:"models,omitempty"`
+	Providers     []string `json:"providers,omitempty"`
 	CallCount     int64    `json:"call_count"`
 	// Partial marks the summary as known-incomplete: an invoked child run is
 	// still running, unreachable, or beyond the depth-1 aggregation.

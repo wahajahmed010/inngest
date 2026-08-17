@@ -22,11 +22,19 @@ const (
 
 //tygo:generate
 type AISummaryMetadata struct {
-	InputTokens   int64    `json:"input_tokens"`
-	OutputTokens  int64    `json:"output_tokens"`
-	TotalTokens   int64    `json:"total_tokens"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+
+	// Absent when no call reported them; cache tokens are summed raw and never
+	// reconciled against InputTokens.
+	CacheReadTokens     *int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens *int64 `json:"cache_creation_tokens,omitempty"`
+	ReasoningTokens     *int64 `json:"reasoning_tokens,omitempty"`
+
 	EstimatedCost *float64 `json:"estimated_cost,omitempty"`
 	Models        []string `json:"models,omitempty"`
+	Providers     []string `json:"providers,omitempty"`
 	CallCount     int64    `json:"call_count"`
 	// Partial marks the summary as known-incomplete: an invoked child run is
 	// still running, unreachable, or beyond the depth-1 aggregation.
@@ -81,29 +89,68 @@ func AIUsageScopeCounted(scope metadata.Scope) bool {
 // including entries from retried attempts: spend on a retried step is real
 // spend.
 type AISummaryBuilder struct {
-	sum     AISummaryMetadata
-	cost    float64
-	hasCost bool
-	models  map[string]struct{}
+	sum       AISummaryMetadata
+	cost      float64
+	hasCost   bool
+	models    map[string]struct{}
+	providers map[string]struct{}
+	// Optional token counters, tracked separately from sum so a field no call
+	// reported stays absent rather than summing to zero.
+	cacheRead     optionalInt64
+	cacheCreation optionalInt64
+	reasoning     optionalInt64
+}
+
+// optionalInt64 accumulates a sum that is only emitted once at least one
+// contributor supplied a value.
+type optionalInt64 struct {
+	value int64
+	set   bool
+}
+
+func (o *optionalInt64) add(v int64) {
+	o.value += v
+	o.set = true
+}
+
+func (o *optionalInt64) addPtr(v *int64) {
+	if v != nil {
+		o.add(*v)
+	}
+}
+
+func (o optionalInt64) ptr() *int64 {
+	if !o.set {
+		return nil
+	}
+	v := o.value
+	return &v
 }
 
 func NewAISummaryBuilder() *AISummaryBuilder {
-	return &AISummaryBuilder{models: map[string]struct{}{}}
+	return &AISummaryBuilder{
+		models:    map[string]struct{}{},
+		providers: map[string]struct{}{},
+	}
 }
 
 // aiUsageValues is the minimal projection of an inngest.ai entry needed to
 // aggregate usage. It deliberately does not reuse AIMetadata: that struct
-// types fields like latency_ms as *int64, but producers emit them as floats
-// (e.g. 2165.798), so unmarshalling the full struct fails and would drop the
-// entry's tokens entirely. Numerics are float64 here so both integer and
+// types optional counts like cache_read_tokens as *int64, but producers can
+// emit them as floats, so unmarshalling the full struct fails and would drop
+// the entry's tokens entirely. Numerics are float64 here so both integer and
 // fractional encodings parse.
 type aiUsageValues struct {
-	InputTokens   float64  `json:"input_tokens"`
-	OutputTokens  float64  `json:"output_tokens"`
-	TotalTokens   *float64 `json:"total_tokens"`
-	EstimatedCost *float64 `json:"estimated_cost"`
-	RequestModel  string   `json:"request_model"`
-	ResponseModel string   `json:"response_model"`
+	InputTokens         float64  `json:"input_tokens"`
+	OutputTokens        float64  `json:"output_tokens"`
+	TotalTokens         *float64 `json:"total_tokens"`
+	CacheReadTokens     *float64 `json:"cache_read_tokens"`
+	CacheCreationTokens *float64 `json:"cache_creation_tokens"`
+	ReasoningTokens     *float64 `json:"reasoning_tokens"`
+	EstimatedCost       *float64 `json:"estimated_cost"`
+	Provider            string   `json:"provider"`
+	RequestModel        string   `json:"request_model"`
+	ResponseModel       string   `json:"response_model"`
 }
 
 // AddCall folds one inngest.ai metadata entry's values into the summary.
@@ -124,6 +171,15 @@ func (b *AISummaryBuilder) AddCall(values metadata.Values) error {
 	} else {
 		b.sum.TotalTokens += int64(m.InputTokens) + int64(m.OutputTokens)
 	}
+	if m.CacheReadTokens != nil {
+		b.cacheRead.add(int64(*m.CacheReadTokens))
+	}
+	if m.CacheCreationTokens != nil {
+		b.cacheCreation.add(int64(*m.CacheCreationTokens))
+	}
+	if m.ReasoningTokens != nil {
+		b.reasoning.add(int64(*m.ReasoningTokens))
+	}
 	if m.EstimatedCost != nil {
 		b.cost += *m.EstimatedCost
 		b.hasCost = true
@@ -133,6 +189,9 @@ func (b *AISummaryBuilder) AddCall(values metadata.Values) error {
 	// surface request aliases that are never a dashboard category.
 	if model := cmp.Or(m.ResponseModel, m.RequestModel); model != "" {
 		b.models[model] = struct{}{}
+	}
+	if m.Provider != "" {
+		b.providers[m.Provider] = struct{}{}
 	}
 	b.sum.CallCount++
 
@@ -145,12 +204,18 @@ func (b *AISummaryBuilder) AddSummary(s AISummaryMetadata) {
 	b.sum.InputTokens += s.InputTokens
 	b.sum.OutputTokens += s.OutputTokens
 	b.sum.TotalTokens += s.TotalTokens
+	b.cacheRead.addPtr(s.CacheReadTokens)
+	b.cacheCreation.addPtr(s.CacheCreationTokens)
+	b.reasoning.addPtr(s.ReasoningTokens)
 	if s.EstimatedCost != nil {
 		b.cost += *s.EstimatedCost
 		b.hasCost = true
 	}
 	for _, m := range s.Models {
 		b.models[m] = struct{}{}
+	}
+	for _, p := range s.Providers {
+		b.providers[p] = struct{}{}
 	}
 	b.sum.CallCount += s.CallCount
 	if s.Partial {
@@ -170,12 +235,18 @@ func (b *AISummaryBuilder) Empty() bool {
 
 func (b *AISummaryBuilder) Summary() AISummaryMetadata {
 	out := b.sum
+	out.CacheReadTokens = b.cacheRead.ptr()
+	out.CacheCreationTokens = b.cacheCreation.ptr()
+	out.ReasoningTokens = b.reasoning.ptr()
 	if b.hasCost {
 		cost := b.cost
 		out.EstimatedCost = &cost
 	}
 	if len(b.models) > 0 {
 		out.Models = slices.Sorted(maps.Keys(b.models))
+	}
+	if len(b.providers) > 0 {
+		out.Providers = slices.Sorted(maps.Keys(b.providers))
 	}
 	return out
 }

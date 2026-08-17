@@ -448,7 +448,8 @@ type TraceReader interface {
 	// GetRunsAIUsage returns each run's aggregated AI usage, summed at read
 	// time from its inngest.ai metadata spans. Used by the GraphQL loader
 	// layer to fold step.invoke child run usage into a parent run's
-	// inngest.ai.summary; runs with no spans are omitted from the result.
+	// inngest.ai.summary; a summary is partial when the run invokes runs of
+	// its own, and runs with no spans are omitted from the result.
 	GetRunsAIUsage(ctx context.Context, runIDs []ulid.ULID) (map[ulid.ULID]extractors.AISummaryMetadata, error)
 	// GetSpansByDebugRunID retrieves all spans related to the specified debug run
 	GetSpansByDebugRunID(ctx context.Context, debugRunID ulid.ULID) ([]*OtelSpan, error)

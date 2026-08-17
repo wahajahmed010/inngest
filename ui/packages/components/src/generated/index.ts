@@ -96,8 +96,16 @@ export interface AISummaryMetadata {
   input_tokens: number /* int64 */;
   output_tokens: number /* int64 */;
   total_tokens: number /* int64 */;
+  /**
+   * Absent when no call reported them; cache tokens are summed raw and never
+   * reconciled against InputTokens.
+   */
+  cache_read_tokens?: number /* int64 */;
+  cache_creation_tokens?: number /* int64 */;
+  reasoning_tokens?: number /* int64 */;
   estimated_cost?: number /* float64 */;
   models?: string[];
+  providers?: string[];
   call_count: number /* int64 */;
   /**
    * Partial marks the summary as known-incomplete: an invoked child run is

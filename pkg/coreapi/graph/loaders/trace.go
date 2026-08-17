@@ -123,9 +123,10 @@ func (tr *traceReader) GetRunTrace(ctx context.Context, keys dataloader.Keys) []
 // root span's inngest.ai.summary metadata entry. The child fetch lives here
 // in the loader layer so that GetSpansByRunID stays a pure in-tree
 // computation (it also serves the rerun path). Only direct children are
-// fetched; deeper descendants and unreachable or still-running children
-// leave the summary marked partial. Any failure degrades gracefully to the
-// in-tree summary, which is already partial whenever invoke steps exist.
+// fetched: unreachable children, unresolved invokes, and children that invoke
+// runs of their own each leave the summary partial. Any failure degrades
+// gracefully to the in-tree summary, which is already partial whenever invoke
+// steps exist.
 func (tr *traceReader) foldChildRunAIUsage(ctx context.Context, root *cqrs.OtelSpan) {
 	foldChildRunAIUsage(ctx, root, tr.reader.GetRunsAIUsage)
 }
@@ -139,7 +140,7 @@ func foldChildRunAIUsage(
 		return
 	}
 
-	childIDs, pending := collectInvokedRunIDs(root, map[ulid.ULID]struct{}{})
+	childIDs, outstanding := collectInvokedRunIDs(root, map[ulid.ULID]struct{}{})
 	if len(childIDs) == 0 {
 		return
 	}
@@ -179,7 +180,7 @@ func foldChildRunAIUsage(
 	existing.Partial = false
 	builder.AddSummary(existing)
 
-	if pending {
+	if outstanding {
 		builder.MarkPartial()
 	}
 	for _, id := range childIDs {
@@ -213,26 +214,32 @@ func foldChildRunAIUsage(
 }
 
 // collectInvokedRunIDs walks the span tree collecting the distinct run IDs of
-// runs invoked via step.invoke. pending reports invoke steps whose child run
-// ID hasn't been stamped yet.
-func collectInvokedRunIDs(span *cqrs.OtelSpan, seen map[ulid.ULID]struct{}) (ids []ulid.ULID, pending bool) {
-	if span.Attributes != nil && span.Attributes.StepInvokeRunID != nil {
-		id := *span.Attributes.StepInvokeRunID
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			ids = append(ids, id)
+// runs invoked via step.invoke. outstanding reports invoke steps that may
+// still yield more usage: either the child run ID hasn't been stamped yet, or
+// the invoke step hasn't resolved. The invoke step span is updated in place
+// when its pause resumes, so its own status stands in for the child run's.
+func collectInvokedRunIDs(span *cqrs.OtelSpan, seen map[ulid.ULID]struct{}) (ids []ulid.ULID, outstanding bool) {
+	if span.IsInvokeStep() {
+		if span.Attributes.StepInvokeRunID != nil {
+			id := *span.Attributes.StepInvokeRunID
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
 		}
-	} else if span.IsInvokeStep() {
-		pending = true
+		// Skipped is terminal but not covered by IsEnded.
+		if !span.Status.IsEnded() && span.Status != enums.StepStatusSkipped {
+			outstanding = true
+		}
 	}
 
 	for _, child := range span.Children {
-		childIDs, childPending := collectInvokedRunIDs(child, seen)
+		childIDs, childOutstanding := collectInvokedRunIDs(child, seen)
 		ids = append(ids, childIDs...)
-		pending = pending || childPending
+		outstanding = outstanding || childOutstanding
 	}
 
-	return ids, pending
+	return ids, outstanding
 }
 
 func (tr *traceReader) opcodeToGQL(op *enums.Opcode) *models.StepOp {

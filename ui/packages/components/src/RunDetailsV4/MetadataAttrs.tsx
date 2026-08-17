@@ -141,7 +141,7 @@ export const MetadataAttrs = ({
 
         return (
           <MetadataAttrRow
-            key={`metadata-attr-${md.scope}-${md.kind}`}
+            key={`metadata-attr-${idx}-${md.scope}-${md.kind}`}
             kind={md.kind}
             scope={md.scope}
             values={md.values}

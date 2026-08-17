@@ -69,6 +69,20 @@ describe('MetadataAttrs', () => {
     expect(screen.getByText('HTTP Timing')).toBeTruthy();
   });
 
+  it('renders every inngest.ai entry when several share the same scope and kind', () => {
+    const secondAiMetadata: SpanMetadata = {
+      ...aiMetadata,
+      updatedAt: '2026-01-01T00:00:03Z',
+      values: { request_model: 'gpt-4o', input_tokens: 55, output_tokens: 66 },
+    };
+
+    renderAttrs([aiMetadata, secondAiMetadata]);
+
+    expect(screen.getAllByText('AI Metadata')).toHaveLength(2);
+    expect(screen.getByText('claude-opus-4')).toBeTruthy();
+    expect(screen.getByText('gpt-4o')).toBeTruthy();
+  });
+
   it('renders the run-level AI summary values', () => {
     renderAttrs([aiSummaryMetadata]);
 

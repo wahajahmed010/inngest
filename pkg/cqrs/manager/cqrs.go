@@ -495,17 +495,17 @@ fragmentLoop:
 	}
 
 	if isMetadata && (info == nil || parentSpanIDPtr != nil) {
-		md, err := rollupSpanMetadataFromFragments(ctx, fragments, parsedEndTime)
+		mds, err := rollupSpanMetadataFromFragments(ctx, fragments, parsedEndTime)
 		switch {
 		case err != nil:
 			logger.StdlibLogger(ctx).Error("error rolling up metadata span", "error", err)
 		case info != nil:
-			info.metadataByParent[*parentSpanIDPtr] = append(info.metadataByParent[*parentSpanIDPtr], md)
+			info.metadataByParent[*parentSpanIDPtr] = append(info.metadataByParent[*parentSpanIDPtr], mds...)
 		default:
 			// Standalone fetch with no tree assembly (e.g. GetSpansByRunIDsAndName
-			// with the metadata span name): attach the rolled-up entry to the
-			// metadata span itself so callers can read it directly.
-			newSpan.Metadata = append(newSpan.Metadata, md)
+			// with the metadata span name): attach the rolled-up entries to the
+			// metadata span itself so callers can read them directly.
+			newSpan.Metadata = append(newSpan.Metadata, mds...)
 		}
 	}
 
@@ -819,18 +819,31 @@ func mapRootSpansFromRows[T normalizedSpan](ctx context.Context, spans []T) (*cq
 		return nil, fmt.Errorf("no root span found for run %s", runID.String())
 	}
 
+	aiUsage := extractors.NewAISummaryBuilder()
+	// Sorted so float cost summation is deterministic across reads.
+	for _, parentSpanID := range slices.Sorted(maps.Keys(metadataByParent)) {
+		addCountedAIMetadata(ctx, aiUsage, metadataByParent[parentSpanID], "run_id", root.RunID.String(), "parent_span_id", parentSpanID)
+	}
+
 	sorter(root)
 	computeAndAttachUsageMetadata(root)
-	computeAndAttachAISummaryMetadata(ctx, root)
+	computeAndAttachAISummaryMetadata(ctx, root, aiUsage)
 
 	return root, nil
 }
 
-func rollupSpanMetadataFromFragments(ctx context.Context, fragments []map[string]any, updatedAt time.Time) (*cqrs.SpanMetadata, error) {
+// rollupSpanMetadataFromFragments folds a metadata span group's fragments into
+// the entries a span carries. Every kind collapses to a single merged entry,
+// except inngest.ai: its merge opcode is last-write-wins, so folding two AI
+// emissions that share a (parent, kind) dynamic span ID would silently discard
+// the earlier call's usage. AI fragments are therefore kept one entry per
+// emission.
+func rollupSpanMetadataFromFragments(ctx context.Context, fragments []map[string]any, updatedAt time.Time) ([]*cqrs.SpanMetadata, error) {
 	ret := &cqrs.SpanMetadata{
 		Values:    metadata.Values{},
 		UpdatedAt: updatedAt,
 	}
+	var perEmission []*cqrs.SpanMetadata
 
 	for _, fragment := range fragments {
 		attrs, ok := fragmentAttributesJSON(fragment["attributes"])
@@ -892,6 +905,16 @@ func rollupSpanMetadataFromFragments(ctx context.Context, fragments []map[string
 			return nil, err
 		}
 
+		if ret.Kind == extractors.KindInngestAI {
+			perEmission = append(perEmission, &cqrs.SpanMetadata{
+				Kind:      ret.Kind,
+				Scope:     ret.Scope,
+				Values:    fragmentMetadata,
+				UpdatedAt: updatedAt,
+			})
+			continue
+		}
+
 		err = ret.Values.Combine(fragmentMetadata, *fragmentAttr.Op)
 		if err != nil {
 			logger.StdlibLogger(ctx).Error("error rolling up metadata span metadata", "error", err)
@@ -899,7 +922,11 @@ func rollupSpanMetadataFromFragments(ctx context.Context, fragments []map[string
 		}
 	}
 
-	return ret, nil
+	if len(perEmission) > 0 {
+		return perEmission, nil
+	}
+
+	return []*cqrs.SpanMetadata{ret}, nil
 }
 
 // computeAndAttachUsageMetadata walks the span tree, sums the size of all
@@ -946,21 +973,25 @@ func walkMetadataSize(span *cqrs.OtelSpan, total *int) {
 	}
 }
 
-// computeAndAttachAISummaryMetadata walks the span tree, sums all counted
-// inngest.ai metadata entries, and attaches a synthetic run-scoped
-// "inngest.ai.summary" entry to the root span. Like inngest.usage, the
+// computeAndAttachAISummaryMetadata attaches a synthetic run-scoped
+// "inngest.ai.summary" entry to the root span from a builder already seeded
+// with every counted inngest.ai entry in the run. Like inngest.usage, the
 // summary is recomputed on every read and never persisted; any stored
 // entries of that kind are stripped first so the computed value is always
 // authoritative and can never double-count itself.
 //
+// The builder is seeded flat rather than by walking the tree so that usage
+// whose parent span is missing, dropped, or excluded from the tree still
+// counts, matching GetRunsAIUsage everywhere the tree path records the
+// metadata at all.
+//
 // Usage from invoked child runs is not folded in here — that happens in the
-// GraphQL loader layer, keeping this a pure in-tree computation — so the
+// GraphQL loader layer, keeping this a pure in-run computation — so the
 // summary is marked partial whenever the tree contains invoke steps.
-func computeAndAttachAISummaryMetadata(ctx context.Context, root *cqrs.OtelSpan) {
+func computeAndAttachAISummaryMetadata(ctx context.Context, root *cqrs.OtelSpan, builder *extractors.AISummaryBuilder) {
 	removeStoredAISummary(root)
 
-	builder := extractors.NewAISummaryBuilder()
-	hasInvokes := walkAIUsage(ctx, root, builder)
+	hasInvokes := walkAIInvokes(root)
 	if builder.Empty() && !hasInvokes {
 		return
 	}
@@ -996,33 +1027,21 @@ func removeStoredAISummary(span *cqrs.OtelSpan) {
 	}
 }
 
-// walkAIUsage folds every counted inngest.ai metadata entry in the tree into
-// the builder and reports whether the tree contains invoke steps — including
-// ones whose child run ID hasn't been stamped yet.
-func walkAIUsage(ctx context.Context, span *cqrs.OtelSpan, builder *extractors.AISummaryBuilder) (hasInvokes bool) {
-	for _, md := range span.Metadata {
-		if md.Kind != extractors.KindInngestAI || !extractors.AIUsageScopeCounted(md.Scope) {
-			continue
-		}
-		if err := builder.AddCall(md.Values); err != nil {
-			logger.StdlibLogger(ctx).Warn(
-				"skipping malformed inngest.ai metadata entry",
-				"run_id", span.RunID.String(),
-				"span_id", span.SpanID,
-				"error", err,
-			)
-		}
+// walkAIInvokes reports whether the tree contains invoke steps — including
+// ones whose child run ID hasn't been stamped yet. Usage itself is summed
+// flat, not walked; see computeAndAttachAISummaryMetadata.
+func walkAIInvokes(span *cqrs.OtelSpan) bool {
+	if span.IsInvokeStep() {
+		return true
 	}
-
-	hasInvokes = span.IsInvokeStep()
 
 	for _, child := range span.Children {
-		if walkAIUsage(ctx, child, builder) {
-			hasInvokes = true
+		if walkAIInvokes(child) {
+			return true
 		}
 	}
 
-	return hasInvokes
+	return false
 }
 
 // extendedTraceKey is the map key used when indexing and reparenting orphaned
@@ -1098,7 +1117,7 @@ func sorter(span *cqrs.OtelSpan) {
 		return span.Children[i].SpanID < span.Children[j].SpanID
 	})
 
-	slices.SortFunc(span.Metadata, func(a, b *cqrs.SpanMetadata) int {
+	slices.SortStableFunc(span.Metadata, func(a, b *cqrs.SpanMetadata) int {
 		return cmp.Or(
 			cmp.Compare(a.Scope, b.Scope),
 			cmp.Compare(a.Kind, b.Kind))
